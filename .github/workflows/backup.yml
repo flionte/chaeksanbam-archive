@@ -2,9 +2,20 @@ name: Auto Backup Naver Blog
 
 on:
   schedule:
-    # Runs every day at 15:00 UTC (00:00 KST / midnight)
+    # 1. 매일 자정 (KST 00:00 = UTC 15:00): 새 글 확인 및 최근 글 5개 퇴고 점검
     - cron: '0 15 * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+    # 2. 매주 일요일 정오 (KST 12:00 = UTC 03:00): 가장 오래 점검 안 한 과거 글 5개 순환 점검
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '실행 모드 선택 (daily: 최신글/새글 점검, weekly: 과거글 순환 점검)'
+        required: true
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - weekly
 
 permissions:
   contents: write
@@ -28,7 +39,15 @@ jobs:
 
       - name: Run blog sync script
         run: |
-          python -u sync_blog.py
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SYNC_MODE="${{ github.event.inputs.mode }}"
+          elif [ "${{ github.event.schedule }}" = "0 3 * * 0" ]; then
+            SYNC_MODE="weekly"
+          else
+            SYNC_MODE="daily"
+          fi
+          echo "Executing sync mode: $SYNC_MODE"
+          python -u sync_blog.py --mode "$SYNC_MODE"
 
       - name: Commit and push changes
         run: |
@@ -38,6 +57,6 @@ jobs:
           if git diff --staged --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Auto-sync: update blog posts and archive"
+            git commit -m "Auto-sync: update blog archive and audit state"
             git push
           fi
