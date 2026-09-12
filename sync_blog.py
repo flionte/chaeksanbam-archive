@@ -7,13 +7,22 @@ import re
 import datetime
 import html
 import sys
+import time
+import argparse
 import traceback
 from bs4 import BeautifulSoup
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 BLOG_ID = "flionte"
 RSS_URL = f"https://rss.blog.naver.com/{BLOG_ID}.xml"
 REPO_DIR = "."
 IMAGES_DIR = os.path.join(REPO_DIR, "images")
+STATE_FILE = os.path.join(REPO_DIR, "audit_state.json")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
 HEADERS = {
@@ -53,22 +62,41 @@ def scan_existing_files():
                 fpath = os.path.join(root, file)
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
-                        header = f.read(800)
+                        header = f.read(1000)
                         m_log = re.search(r'logNo:\s*"(\d+)"', header)
                         m_cat = re.search(r'category:\s*"([^"]*)"', header)
                         m_title = re.search(r'title:\s*"([^"]*)"', header)
+                        m_date = re.search(r'date:\s*"([^"]*)"', header)
                         if m_log:
                             log_no = m_log.group(1)
                             cat = m_cat.group(1) if m_cat else os.path.basename(root)
                             title = m_title.group(1) if m_title else file[:-3]
+                            pub_date = m_date.group(1) if m_date else ""
                             existing[log_no] = {
                                 'path': fpath,
                                 'category': clean_category(cat),
-                                'title': title
+                                'title': title,
+                                'date': pub_date
                             }
                 except Exception:
                     pass
     return existing
+
+def load_audit_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_audit_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Failed to save audit state: {e}")
 
 def fetch_rss_feed():
     posts = []
@@ -96,7 +124,7 @@ def fetch_rss_feed():
             })
         print(f"Fetched {len(posts)} posts from RSS feed.")
     except Exception as e:
-        print(f"RSS fetch error: {e}")
+        print(f"RSS fetch warning: {e}")
     return posts
 
 def crawl_and_render_post(log_no, p_meta):
@@ -105,11 +133,22 @@ def crawl_and_render_post(log_no, p_meta):
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=12) as resp:
             page_html = resp.read().decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            print(f"[{log_no}] HTTP {e.code}: 게시글이 삭제되었거나 존재하지 않습니다.")
+            return {'status': 'deleted_or_private', 'logNo': log_no}
+        print(f"[{log_no}] HTTP {e.code}: {e}")
+        return {'status': 'error', 'logNo': log_no}
     except Exception as e:
         print(f"[{log_no}] Failed to fetch post HTML: {e}")
-        return None
+        return {'status': 'error', 'logNo': log_no}
 
     soup = BeautifulSoup(page_html, 'html.parser')
+
+    # Detect deleted or private posts
+    container = soup.select_one('.se-main-container') or soup.select_one('#postViewArea')
+    if not container or "삭제되었거나" in page_html or "비공개" in page_html or "존재하지 않는 게시글" in page_html:
+        return {'status': 'deleted_or_private', 'logNo': log_no}
 
     title_elem = soup.select_one('.se-title-text') or soup.select_one('.pcol1')
     raw_title = title_elem.get_text(strip=True) if title_elem else p_meta.get('title', '')
@@ -127,10 +166,6 @@ def crawl_and_render_post(log_no, p_meta):
     if m and m.group(1):
         tags = [t.strip() for t in m.group(1).split(',') if t.strip()]
     tags = [t for t in tags if t not in ['취소', '확인', '네이버블로그', '책산밤 블로그']]
-
-    container = soup.select_one('.se-main-container') or soup.select_one('#postViewArea')
-    if not container:
-        return None
 
     components = container.select('.se-component')
     md_body = []
@@ -269,12 +304,82 @@ tags: {json.dumps(tags, ensure_ascii=False)}
 *원문 출처: [https://blog.naver.com/{BLOG_ID}/{log_no}](https://blog.naver.com/{BLOG_ID}/{log_no})*
 """
     return {
+        'status': 'ok',
         'logNo': log_no,
         'title': clean_title,
         'category': cat_name,
         'date': pub_date,
         'md_content': full_md
     }
+
+def save_or_update_post(res, existing_info=None):
+    clean_cat = clean_category(res['category'])
+    cat_dir = os.path.join(REPO_DIR, clean_cat)
+    os.makedirs(cat_dir, exist_ok=True)
+    date_prefix = parse_date_for_filename(res['date'])
+    fname = f"{date_prefix}_{clean_filename(res['title'])}.md"
+    new_fpath = os.path.join(cat_dir, fname)
+
+    if existing_info and os.path.exists(existing_info['path']):
+        old_path = existing_info['path']
+        if os.path.normpath(old_path) != os.path.normpath(new_fpath):
+            try:
+                os.remove(old_path)
+            except Exception:
+                pass
+
+    with open(new_fpath, "w", encoding="utf-8") as wf:
+        wf.write(res['md_content'])
+
+    return new_fpath
+
+def audit_single_post(log_no, existing_info, audit_state, p_meta=None):
+    now_iso = datetime.datetime.now().isoformat()
+    meta = p_meta or existing_info
+    res = crawl_and_render_post(log_no, meta)
+
+    if not res or res.get('status') == 'error':
+        print(f"[{log_no}] 점검 일시 오류(네트워크) - 다음 주기에 재점검합니다.")
+        return False
+
+    if res.get('status') == 'deleted_or_private':
+        print(f"[{log_no}] 네이버에서 삭제/비공개 감지됨: 기존 아카이브 파일 영구 보존")
+        audit_state[log_no] = {
+            'last_checked': now_iso,
+            'status': 'naver_deleted_or_private'
+        }
+        return False
+
+    if res.get('status') == 'ok':
+        fpath = existing_info['path']
+        content_changed = False
+
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8") as rf:
+                old_text = rf.read().replace('\r\n', '\n').strip()
+            new_text = res['md_content'].replace('\r\n', '\n').strip()
+            if old_text != new_text:
+                content_changed = True
+        else:
+            content_changed = True
+
+        audit_state[log_no] = {
+            'last_checked': now_iso,
+            'status': 'active'
+        }
+
+        if content_changed:
+            new_path = save_or_update_post(res, existing_info)
+            existing_info['path'] = new_path
+            existing_info['category'] = res['category']
+            existing_info['title'] = res['title']
+            print(f"[{log_no}] [퇴고 반영 완료] {res['title']}")
+            return True
+        else:
+            print(f"[{log_no}] [내용 일치/퇴고 없음] {existing_info['title']}")
+            return False
+
+    return False
 
 def rebuild_readme():
     posts_data = []
@@ -309,7 +414,7 @@ def rebuild_readme():
 
 > **"공상 해소"**  
 > 네이버 블로그 [책산밤(flionte)](https://blog.naver.com/flionte)의 모든 글을 영구 보존하는 독립 마크다운 아카이브입니다.  
-> **GitHub Actions**를 통해 네이버 블로그에 새 글이 작성되거나 카테고리가 변경되면 자동으로 동기화됩니다.
+> **GitHub Actions**를 통해 매일 자정 최신 글 퇴고 점검 및 매주 정오 과거 글 순환 롤링 점검이 자동으로 수행됩니다.
 
 ---
 
@@ -343,58 +448,115 @@ def rebuild_readme():
     print("README.md updated.")
 
 def main():
-    print("Starting lightweight blog sync...")
+    parser = argparse.ArgumentParser(description="Naver Blog Sync & Dual Rolling Audit")
+    parser.add_argument("--mode", choices=["daily", "weekly"], default="daily", help="Sync mode: daily or weekly")
+    args = parser.parse_args()
+
+    mode = args.mode
+    print(f"=== Blog Sync & Audit Started [Mode: {mode.upper()}] ===")
+
     try:
         existing = scan_existing_files()
-        print(f"Existing archived posts: {len(existing)}")
+        print(f"Archived posts on disk: {len(existing)}")
 
-        online_posts = fetch_rss_feed()
-        if not online_posts:
-            print("RSS feed empty or unavailable.")
-            return
+        audit_state = load_audit_state()
+
+        # Seed initial state for any posts not yet recorded in audit state
+        for log_no in existing:
+            if log_no not in audit_state:
+                audit_state[log_no] = {
+                    'last_checked': '2026-09-09T00:00:00',
+                    'status': 'active'
+                }
 
         updated = False
 
-        for p in online_posts:
-            log_no = p['logNo']
+        if mode == "daily":
+            # 1. Fetch RSS (fast, reliable, 1 request)
+            online_posts = fetch_rss_feed()
 
-            if log_no not in existing:
-                print(f"New post found: {log_no} - {p['title']}")
-                res = crawl_and_render_post(log_no, p)
-                if res:
-                    cat_dir = os.path.join(REPO_DIR, res['category'])
-                    os.makedirs(cat_dir, exist_ok=True)
-                    date_prefix = parse_date_for_filename(res['date'])
-                    fname = f"{date_prefix}_{clean_filename(res['title'])}.md"
-                    fpath = os.path.join(cat_dir, fname)
-                    with open(fpath, "w", encoding="utf-8") as wf:
-                        wf.write(res['md_content'])
-                    print(f"Saved new post: {fpath}")
-                    existing[log_no] = {'path': fpath, 'category': res['category'], 'title': res['title']}
+            # 2. Check for newly published posts
+            for p in online_posts:
+                log_no = p['logNo']
+                if log_no not in existing:
+                    print(f"[새 글 발견] {log_no} - {p['title']}")
+                    res = crawl_and_render_post(log_no, p)
+                    if res and res.get('status') == 'ok':
+                        new_path = save_or_update_post(res)
+                        existing[log_no] = {'path': new_path, 'category': res['category'], 'title': res['title'], 'date': res['date']}
+                        audit_state[log_no] = {
+                            'last_checked': datetime.datetime.now().isoformat(),
+                            'status': 'active'
+                        }
+                        updated = True
+                else:
+                    # Quick category change check via RSS
+                    old_info = existing[log_no]
+                    if p['category'] and p['category'] != old_info['category']:
+                        old_path = old_info['path']
+                        new_cat = p['category']
+                        print(f"카테고리 이동 감지 ({log_no}): {old_info['category']} -> {new_cat}")
+                        new_cat_dir = os.path.join(REPO_DIR, new_cat)
+                        os.makedirs(new_cat_dir, exist_ok=True)
+                        new_path = os.path.join(new_cat_dir, os.path.basename(old_path))
+                        os.rename(old_path, new_path)
+                        with open(new_path, "r", encoding="utf-8") as rf:
+                            old_text = rf.read()
+                        new_text = re.sub(r'category:\s*"[^"]*"', f'category: "{new_cat}"', old_text)
+                        with open(new_path, "w", encoding="utf-8") as wf:
+                            wf.write(new_text)
+                        existing[log_no]['path'] = new_path
+                        existing[log_no]['category'] = new_cat
+                        updated = True
+
+            # 3. Daily Audit: Check top 5 latest posts for any post revisions (퇴고)
+            target_candidates = online_posts[:5] if online_posts else []
+            if not target_candidates:
+                # Fallback to 5 newest on disk by date if RSS is unavailable
+                sorted_by_date = sorted(existing.keys(), key=lambda x: existing[x].get('date', ''), reverse=True)
+                target_candidates = [{'logNo': k} for k in sorted_by_date[:5]]
+
+            print(f"\n[Daily Audit] 최근 글 5개 퇴고 여부 점검 진행:")
+            for p in target_candidates:
+                log_no = p['logNo']
+                if log_no in existing:
+                    time.sleep(1.0)
+                    changed = audit_single_post(log_no, existing[log_no], audit_state, p)
+                    if changed:
+                        updated = True
+
+        elif mode == "weekly":
+            # Weekly Audit: Pick 5 least-recently-checked posts (LRU rotation)
+            def get_check_time(log_no):
+                entry = audit_state.get(log_no, {})
+                if isinstance(entry, dict):
+                    return entry.get('last_checked', '1970-01-01T00:00:00')
+                elif isinstance(entry, str):
+                    return entry
+                return '1970-01-01T00:00:00'
+
+            candidates = list(existing.keys())
+            candidates.sort(key=get_check_time)
+            target_5 = candidates[:5]
+
+            print(f"\n[Weekly Audit] 가장 오랫동안 미점검된 과거 글 5개 순환 점검 진행:")
+            for log_no in target_5:
+                last_time = get_check_time(log_no)
+                print(f"점검 대상: {log_no} (마지막 점검: {last_time}) - {existing[log_no]['title']}")
+                time.sleep(1.0)
+                changed = audit_single_post(log_no, existing[log_no], audit_state)
+                if changed:
                     updated = True
-            else:
-                old_info = existing[log_no]
-                if p['category'] and p['category'] != old_info['category']:
-                    old_path = old_info['path']
-                    new_category = p['category']
-                    print(f"Category changed for {log_no} ({p['title']}): {old_info['category']} -> {new_category}")
-                    new_cat_dir = os.path.join(REPO_DIR, new_category)
-                    os.makedirs(new_cat_dir, exist_ok=True)
-                    new_path = os.path.join(new_cat_dir, os.path.basename(old_path))
-                    os.rename(old_path, new_path)
-                    with open(new_path, "r", encoding="utf-8") as rf:
-                        old_text = rf.read()
-                    new_text = re.sub(r'category:\s*"[^"]*"', f'category: "{new_category}"', old_text)
-                    with open(new_path, "w", encoding="utf-8") as wf:
-                        wf.write(new_text)
-                    existing[log_no] = {'path': new_path, 'category': new_category, 'title': old_info['title']}
-                    updated = True
+
+        # Clean up audit_state for any files no longer on disk
+        audit_state = {k: v for k, v in audit_state.items() if k in existing}
+        save_audit_state(audit_state)
 
         if updated:
             rebuild_readme()
-            print("Sync completed: updates found and applied.")
+            print("Sync completed: Changes applied and saved.")
         else:
-            print("Sync completed: all posts up to date. No network overhead.")
+            print("Sync completed: All inspected posts up to date. No content changes.")
 
     except Exception as e:
         print(f"Unexpected sync error: {e}")
