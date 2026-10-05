@@ -54,6 +54,18 @@ def parse_date_for_filename(date_str):
         return f"{int(m2.group(1)):04d}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
     return datetime.date.today().strftime("%Y-%m-%d")
 
+def extract_title_from_header(header):
+    m = re.search(r'^title:\s*(.*)$', header, re.MULTILINE)
+    if m:
+        raw_val = m.group(1).strip()
+        if raw_val.startswith('"') and raw_val.endswith('"'):
+            try:
+                return json.loads(raw_val)
+            except Exception:
+                return raw_val[1:-1].replace(r'\"', '"').replace(r'\\', '\\')
+        return raw_val.strip('"')
+    return ""
+
 def scan_existing_files():
     existing = {}
     for root, dirs, files in os.walk(REPO_DIR):
@@ -67,19 +79,11 @@ def scan_existing_files():
                         header = f.read(1000)
                         m_log = re.search(r'logNo:\s*"(\d+)"', header)
                         m_cat = re.search(r'category:\s*"([^"]*)"', header)
-                        m_title = re.search(r'title:\s*(".*?"|[^\n]+)', header)
                         m_date = re.search(r'date:\s*"([^"]*)"', header)
+                        title = extract_title_from_header(header) or file[:-3]
                         if m_log:
                             log_no = m_log.group(1)
                             cat = m_cat.group(1) if m_cat else os.path.basename(root)
-                            if m_title:
-                                raw_t = m_title.group(1).strip()
-                                try:
-                                    title = json.loads(raw_t) if raw_t.startswith('"') else raw_t.strip('"')
-                                except Exception:
-                                    title = raw_t.strip('"')
-                            else:
-                                title = file[:-3]
                             pub_date = m_date.group(1) if m_date else ""
                             existing[log_no] = {
                                 'path': fpath,
@@ -505,17 +509,9 @@ def rebuild_readme():
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         text = f.read(1000)
-                        title_m = re.search(r'title:\s*(".*?"|[^\n]+)', text)
+                        title = extract_title_from_header(text) or file[:-3]
                         date_m = re.search(r'date:\s*"([^"]+)"', text)
                         url_m = re.search(r'original_url:\s*"([^"]+)"', text)
-                        if title_m:
-                            raw_t = title_m.group(1).strip()
-                            try:
-                                title = json.loads(raw_t) if raw_t.startswith('"') else raw_t.strip('"')
-                            except Exception:
-                                title = raw_t.strip('"')
-                        else:
-                            title = file[:-3]
                         date = date_m.group(1) if date_m else ""
                         url = url_m.group(1) if url_m else ""
                         posts_data.append({
@@ -558,7 +554,8 @@ def rebuild_readme():
         readme += "| :--- | :--- | :--- |\n"
         for cp in cat_posts:
             encoded_path = urllib.parse.quote(cp['rel_path'])
-            readme += f"| {cp['date']} | [{cp['title']}]({encoded_path}) | [네이버]({cp['url']}) |\n"
+            safe_table_title = cp['title'].replace('|', '\\|')
+            readme += f"| {cp['date']} | [{safe_table_title}]({encoded_path}) | [네이버]({cp['url']}) |\n"
         readme += "\n"
 
     with open(os.path.join(REPO_DIR, "README.md"), "w", encoding="utf-8") as f:
